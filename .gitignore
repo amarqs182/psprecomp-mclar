@@ -1,0 +1,50 @@
+# Game data and user-owned content — never committed.
+*.iso
+*.zip
+*.cso
+*.chd
+*.pbp
+*.prx
+EBOOT.BIN
+EBOOT.ELF
+BOOT.BIN
+DATA.PSP
+*.elf
+*.ELF
+
+# Recompiled output — generated, large, and not the source of truth for review.
+# (The upstream project's convention is to commit generated C; we do not,
+#  because it is several hundred MB and the repo must stay source-only.)
+scratch/generated/
+scratch/ghidra/
+scratch/rea/
+scratch/*.rep/
+scratch/*.gpr
+
+# Ghidra project files and analysis artifacts.
+*.gpr
+*.rep/
+*.gdb
+*.idb
+*.i64
+ghidra-allegrex/
+GhidraMCP/
+*.log
+
+# Toolchain / build artifacts.
+build/
+build-*/
+*.o
+*.a
+*.so
+*.squashfs
+
+# Never ship generated recompiled C++/C sources of the game.
+*_funcs_*.c
+*_funcs_*.h
+
+# Editor / OS noise.
+.vscode/
+.idea/
+.DS_Store
+*.swp

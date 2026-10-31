@@ -1,0 +1,22 @@
+# aarch64 cross-compilation toolchain for R36S (darkosre)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+set(CROSS_ROOT /home/amarqs/tools/aarch64-sysroot)
+set(CROSS_TRIPLET aarch64-linux-gnu)
+
+set(CMAKE_C_COMPILER ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-gcc)
+set(CMAKE_CXX_COMPILER ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-g++)
+set(CMAKE_AR ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-ar)
+set(CMAKE_LINKER ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-ld)
+set(CMAKE_STRIP ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-strip)
+set(CMAKE_OBJCOPY ${CROSS_ROOT}/usr/bin/${CROSS_TRIPLET}-objcopy)
+
+set(CMAKE_FIND_ROOT_PATH ${CROSS_ROOT})
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# Tell CMake we are cross-compiling
+set(CMAKE_CROSSCOMPILING ON)
