@@ -18,6 +18,14 @@ set(_r36s_triplet "aarch64-linux-gnu")
 set(_r36s_libdir "${_r36s_sysroot}/usr/lib/${_r36s_triplet}")
 
 set(CMAKE_C_COMPILER "${_r36s_sysroot}/usr/bin/${_r36s_triplet}-gcc")
+set(CMAKE_ASM_COMPILER "${_r36s_sysroot}/usr/bin/${_r36s_triplet}-as")
+
+# The Arch gcc build looks for the assembler and linker next to *itself* on
+# PATH, not next to its own prefix, so it picks up the host's x86-64 `as`
+# and fails with "opção não reconhecida “-EL”" (-EL is the AArch64
+# little-endian marker). `-B<dir>` tells gcc where to find its own binutils,
+# which makes the cross build independent of the caller's PATH.
+set(CMAKE_C_FLAGS_INIT "-B${_r36s_sysroot}/usr/bin/")
 
 # The Arch gcc build hardcodes its own include/lib search relative to the
 # toolchain prefix; point it at the Debian-layout sysroot instead.

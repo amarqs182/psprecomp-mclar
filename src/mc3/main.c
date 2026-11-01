@@ -249,12 +249,20 @@ int main(int argc, char **argv) {
     signal(SIGSEGV, on_segv);
     psp_threadman_reset();
 
-    /* 7. watchdog: 30 s of guest time, then longjmp back so we still report. */
+    /* 7. watchdog: 30 s of guest time, then longjmp back so we still report.
+     * The bring-up runs need longer than that to get past the boot sequence
+     * on the RK3326, so the timeout is overridable from the environment. */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_alarm;
     sigaction(SIGALRM, &sa, NULL);
-    alarm(30);
+    int watchdog_secs = 30;
+    const char *wd_env = getenv("MC3_WATCHDOG");
+    if (wd_env && *wd_env) {
+        int v = atoi(wd_env);
+        if (v > 0) watchdog_secs = v;
+    }
+    alarm((unsigned)watchdog_secs);
 
     /* 8. run module_start (entry 0x000005A4) as the boot thread.
      * On a real PSP the kernel passes threadargs_size in $a0 and an arg
@@ -416,7 +424,13 @@ int main(int argc, char **argv) {
      * backend is exercised and something appears on screen. */
     uint64_t frames = 0;
     int      drew_dummy = 0;
-    while (!psp_exit_requested() && !g_watchdog_fired && frames < 300) {
+    uint64_t max_frames = 300;
+    const char *frames_env = getenv("MC3_FRAMES");
+    if (frames_env && *frames_env) {
+        long v = atol(frames_env);
+        if (v > 0) max_frames = (uint64_t)v;
+    }
+    while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
         psp_threadman_yield();                    /* let guest threads run */
 
         /* If the game hasn't submitted any GE commands yet, draw a dummy
