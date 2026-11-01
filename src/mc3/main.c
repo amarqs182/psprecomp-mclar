@@ -160,12 +160,14 @@ static void on_alarm(int sig) {
 int main(int argc, char **argv) {
     const char *elf_path = NULL;
     const char *render_name = "software";
+    const char *data_dir = ".";
     int opt;
-    while ((opt = getopt(argc, argv, "e:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "e:r:d:")) != -1) {
         if (opt == 'e') elf_path = optarg;
         else if (opt == 'r') render_name = optarg;
+        else if (opt == 'd') data_dir = optarg;
         else {
-            fprintf(stderr, "usage: mc3 -e <EBOOT.ELF> [-r software|gles32|null]\n");
+            fprintf(stderr, "usage: mc3 -e <EBOOT.ELF> [-r software|gles32|null] [-d <data_dir>]\n");
             return 2;
         }
     }
@@ -186,6 +188,12 @@ int main(int argc, char **argv) {
 
     /* 2. HLE firmware surface */
     psp_hle_init();
+    /* The guest sees the disc as "disc0:/". The host root holds one
+     * subdirectory per device prefix (disc/, ms/, flash/, host/), so the
+     * game finds disc0:/PSP_GAME/USRDIR/PCODE.TXT under <data_dir>/disc/.
+     * Without this the game spins in a retry loop waiting for a file that
+     * is not there. */
+    psp_io_set_root(data_dir);
 
     /* 3. register every recompiled function (+ interior labels) */
     psp_recomp_register();
@@ -195,6 +203,24 @@ int main(int argc, char **argv) {
      * entry discovered by psprecomp, so register a stub that just returns. */
     psp_register(0x003F302Cu, psp_stub_003F302C);
     psp_register(0x003886A8u, psp_stub_003F302C);
+
+    /* 3b. Register the boot-to-GE chain for hit counting. The static call
+     * graph says module_start reaches the GE/Display init through
+     * 0x5A4 -> 0x6AC -> 0x8 -> 0x2DAE78 -> 0x1EC -> 0x137538 -> 0x2EFE48
+     * -> 0x2B0378 -> 0x2A8C50, but a static graph cannot say which link
+     * fails at runtime. Counting each link shows exactly where it stops.
+     *
+     * The chain actually starts in the game's own thread: module_start calls
+     * sceKernelCreateThread with entry 0x000006B8 and starts it. */
+    {
+        static const uint32_t watch[] = {
+            0x000005A4u, 0x000006B8u, 0x00000718u, 0x00000748u, 0x00000788u,
+            0x000007C0u, 0x00000008u, 0x002DAE78u, 0x000001ECu, 0x000002E8u,
+            0x00137538u, 0x002EFE48u, 0x002B0378u, 0x002A8C50u, 0x002A8B64u,
+            0x002A8E14u, 0x002A8F04u, 0x002A918Cu, 0x003806D0u, 0x003807ACu,
+        };
+        psp_trace_watch_multi(watch, (int)(sizeof(watch) / sizeof(watch[0])));
+    }
 
     /* 4. CPU — set initial stack pointer into user RAM (the module links at
      * address 0 and expects $sp to be set by the kernel; our loader doesn't
@@ -439,6 +465,48 @@ int main(int argc, char **argv) {
     fprintf(stderr, "peak RSS:      %llu KiB\n",
             (unsigned long long)peak_rss_kb());
     fprintf(stderr, "=================\n");
+
+    /* The boot-to-GE call chain, from module_start down to the function that
+     * calls sceGeListEnqueue / sceDisplaySetFrameBuf. Each link is reported
+     * with its hit count, so a run that stops early shows exactly which link
+     * was not reached.
+     *
+     * The real chain runs in the *game's own thread*, not in module_start:
+     * module_start creates a thread with entry 0x000006B8 (the arg-parsing
+     * wrapper: $s3 = threadargs_size, $s2 = argp) and starts it. That entry
+     * then walks 0x6B8 -> 0x718 -> 0x748 -> 0x788 -> 0x7C0 -> 0x8 -> ... The
+     * static graph showed the chain but not that it starts at a thread entry. */
+    {
+        static const uint32_t chain[] = {
+            0x000005A4u, /* module_start                                  */
+            0x000006B8u, /* game main thread entry (created by module_start)*/
+            0x00000718u, /* 0x6B8 -> 0x718  (arg parse loop)              */
+            0x00000748u, /* 0x718 -> 0x748  (arg parse done)              */
+            0x00000788u, /* 0x748 -> 0x788                                 */
+            0x000007C0u, /* 0x788 -> 0x7C0                                 */
+            0x00000008u, /* 0x7C0 -> 0x8  (thread body)                   */
+            0x002DAE78u, /* 0x8 -> 0x2DAE78                               */
+            0x000001ECu, /* 0x2DAE78 -> 0x1EC                             */
+            0x000002E8u, /* 0x1EC -> 0x2E8                               */
+            0x00137538u, /* 0x2E8 -> 0x137538                            */
+            0x002EFE48u, /* 0x137538 -> 0x2EFE48                         */
+            0x002B0378u, /* 0x2EFE48 -> 0x2B0378                         */
+            0x002A8C50u, /* 0x2B0378 -> 0x2A8C50  (GE + Display init)    */
+            0x002A8B64u, /* per-frame GE submit                          */
+            0x002A8E14u, /* GE list enqueue                               */
+            0x002A8F04u, /* GE list enqueue                               */
+            0x002A918Cu, /* Display set frame buf                         */
+            0x003806D0u, /* Display                                       */
+            0x003807ACu, /* Display                                       */
+        };
+        fprintf(stderr, "\n=== boot -> GE chain hit counts ===\n");
+        for (size_t i = 0; i < sizeof(chain) / sizeof(chain[0]); i++)
+            fprintf(stderr, "  %08X -> %llu\n", chain[i],
+                    (unsigned long long)psp_trace_watch_count(chain[i]));
+        /* The last N functions entered, in order. This shows the path the run
+         * actually took -- the hit counts only say which links ran. */
+        psp_trace_dump();
+    }
 
     psp_render_current()->shutdown();
     psp_mem_free();

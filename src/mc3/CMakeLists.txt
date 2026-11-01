@@ -49,6 +49,23 @@ if (PSPRECOMP_HAVE_GLES)
     target_link_libraries(mc3 PRIVATE ${PKG_GLES_LIBS})
 endif()
 
+# Diagnostic build: records every function entry so psp_trace_watch_multi()
+# can report how far down the boot->GE chain the run actually got. Costs one
+# store per call and slows the run down, so it is a separate target rather
+# than a flag on the shipping binary.
+add_executable(mc3_trace ${MC3_SRCS})
+target_include_directories(mc3_trace PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/psprecomp/include
+    ${GEN_DIR}
+)
+target_link_libraries(mc3_trace PRIVATE psprecomp m)
+target_compile_definitions(mc3_trace PRIVATE PSPRECOMP_TRACE=1)
+if (PSPRECOMP_HAVE_GLES)
+    target_compile_definitions(mc3_trace PRIVATE PSPRECOMP_HAVE_GLES=1)
+    target_compile_options(mc3_trace PRIVATE ${PKG_GLES_CFLAGS})
+    target_link_libraries(mc3_trace PRIVATE ${PKG_GLES_LIBS})
+endif()
+
 # Emit a reminder if the generated directory is empty (forgot to run `emit`).
 if(NOT GEN_FUNCS)
     message(WARNING "mc3: scratch/generated/mc3_funcs_*.c is empty — run \""

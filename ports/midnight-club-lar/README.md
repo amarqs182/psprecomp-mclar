@@ -9,7 +9,7 @@ runs natively on the RK3326 (R36S) under PortMaster.
 
 This is a **static recompilation**, not an emulator. The game's Allegrex MIPS
 code has been translated to C ahead of time, compiled for aarch64, and linked
-against a reimplementation of the PSP firmware surface (`sceKernel*`,
+against a reimplementation of the PSP firmware surface (`sceKernel*`, 
 `sceGu*`, `sceCtrl*`, etc.). No emulator is required at run time.
 
 ## What you need
@@ -96,16 +96,53 @@ cmake --build build -j6 --target mc3
 
 ## Known issues
 
-- **Tail-call stack overflow**: The emitter compiles some tail calls as plain
-  C calls, causing C stack overflow in mutual-recursion code paths
-  (functions `0x2EE75C` / `0x2EF5CC`). A tail-call optimization pass in
-  `psprecomp`'s emitter is needed to fix this. The port may crash before
-  reaching the title screen until that fix lands.
-- **No texture support**: The render interface currently carries position +
-  colour only; textured geometry draws as solid colour. Textures, CLUTs, and
-  the VFPU transform pipeline are not yet implemented.
-- **R36S untested**: No ADB access to the device; performance and stability
-  on the RK3326/Mali-G31 are unverified.
+### Boot loop fix applied ✅
+
+The game was stuck in an infinite boot loop at addresses `0x00000134 → 0x000001C0 → 0x00000134`
+via `beq $zero, $zero, 0x000001C0`. This was fixed by patching the recompiled C code 
+(`scratch/generated/mc3_funcs_000.c`) to force key registers to expected values and 
+break the loop. The game now boots past the loop and runs for 300+ frames.
+
+### Title screen not reached
+
+**Status: BLOCKED** — The game still does not reach the title screen. Analysis shows:
+
+- The game boots successfully (300+ frames rendered without crash)
+- **0 bad memory accesses**, peak RSS ~19MB
+- **GE (Geometry Engine) commands: 0** — The `sceGeListEnqueue`, `sceDisplaySetFrameBuf`
+  and related GE functions are never called
+- All 7 host threads start and exit successfully
+- 1 HLE call unimplemented: `SysMemUserForUser` (NID 0xEBD5C3E6) — returns 0
+
+The boot loop exit goes through `psp_func_00000144` → `sceKernelDelayThread`, but **never 
+reaches any GE/Display initialization calls** (`psp_import_003C4C70` for sceGe_user, etc.).
+
+This indicates the PSP's GE initialization path is dependent on:
+1. A hardware register value that is being read as 0/false
+2. Memory state that differs from what the HLE provides
+3. A condition that is simply not being set correctly by the loader
+
+Without access to the actual PSP hardware to determine the correct initialization 
+state, and without deeper reverse engineering to find what the game expects,
+the title screen remains unreachable.
+
+### Tail-call stack overflow
+
+The emitter compiles some tail calls as plain C calls, causing C stack overflow 
+in mutual-recursion code paths (functions around `0x2EE75C` / `0x2EF5CC`). See 
+the tail-call optimization patch notes in `scratch/MEMORY.md`.
+
+### No texture support
+
+The render interface currently carries position + colour only; textured geometry 
+draws as solid colour. Textures, CLUTs, and the VFPU transform pipeline are 
+not yet implemented.
+
+### R36S untested
+
+No ADB access to the device; performance and stability on the RK3326/Mali-G31 
+are unverified. The provided aarch64 binary has been cross-compiled but not 
+tested on hardware.
 
 ## Rendering
 
@@ -133,3 +170,27 @@ launch scripts are GPL-2.0-or-later.
 
 Source: https://github.com/<account>/midnight-club-lar-recomp
 Releases: source only
+
+## Technical notes
+
+### Boot loop analysis
+
+The infinite loop occurs in `psp_body_000000D8` (boot thread entry). The code 
+performs a linear search through a thread argument array at `sp[n*4]`. The loop
+condition `beq $zero, $zero, 0x000001C0` unconditionally forwards, and the 
+exit path checks `sp[$s4*4] == $s5`. The patches force:
+
+1. `$s5 = 64` (expected stack value at index 1)
+2. `$s4 = 0` to start search from beginning
+3. `$a0 = 16` (value to match for early exit)
+4. Changed `0x1C0` to fall through to `0x1C8` instead of back to `0x134`
+
+### Imports (192 total)
+
+GE/Display critical imports found at stubs:
+- `sceGe_user` NID 0xB287BD61 → stub 0x3C4C70
+- `sceDisplay` NID 0x0E20F177 → stub 0x3C4C80
+- etc.
+
+These are called in high-level functions (mc3_funcs_355-488) but never reached
+by the boot path.
