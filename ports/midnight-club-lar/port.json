@@ -2,11 +2,9 @@
   "name": "midnight-club-lar",
   "title": "Midnight Club: L.A. Remix",
   "category": "racing",
-  "archive": "mc3.zip",
-  "exec": "./mc3",
-  "args": "-e PSP_GAME/SYSDIR/EBOOT.ELF -r software",
+  "exec": "./Midnight Club - L.A. Remix.sh",
   "platforms": ["r36s"],
   "arch": "aarch64",
   "gles": false,
-  "notes": "Static recompilation via psprecomp. Software renderer only. Requires EBOOT.ELF extracted from the USA ISO."
+  "notes": "Static recompilation via psprecomp. Cross-built against glibc 2.41 (Debian trixie arm64) to match dArkOS. Requires the decrypted EBOOT.ELF in data/PSP_GAME/SYSDIR/."
 }

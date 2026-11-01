@@ -21,7 +21,10 @@ Last updated: 2026-10-31 (milestone 1, in progress)
 | JDK | **Temurin 21.0.9+10** | `~/.local/share/mise/installs/java/temurin-21.0.9+10.0.LTS` |
 | REA | `rea-agents` **6.8.0** (global npm) | `/home/amarqs/.local/bin/rea` |
 | GhidraMCP | **2.0** (release 2026-10-10) | plugin installed into Ghidra 12.1.4 only |
-| Cross toolchain | Arch `aarch64-linux-gnu-gcc` **16.2.0** + binutils 2.47 + glibc 2.44 | `~/tools/aarch64-sysroot` (extracted, no root) |
+| Cross toolchain | Arch `aarch64-linux-gnu-gcc` **16.2.0** + binutils 2.47 | `~/tools/r36s-sysroot` (extracted, no root) |
+| Target glibc | Debian trixie **2.41** arm64 (`libc6` + `libc6-dev` 2.41-12+deb13u4) | `~/tools/r36s-sysroot/usr` |
+| Kernel headers | `linux-libc-dev` **6.1.176** arm64 | `~/tools/r36s-sysroot/usr/include` |
+| Toolchain file | `cmake/r36s-toolchain.cmake` | project root |
 
 ### Version reconciliation (Ghidra 12.1.3 vs 12.1.4)
 
@@ -251,24 +254,71 @@ as a bug to resolve before proceeding" is being followed by recording it here.
 
 ### Cross compiler
 
-`aarch64-linux-gnu-gcc` was installed **without root** by downloading the Arch
-`extra` packages and extracting them into `~/tools/aarch64-sysroot`:
+Two sysroots exist. **Use `~/tools/r36s-sysroot` — the older
+`~/tools/aarch64-sysroot` produces binaries that will not run on the device.**
+
+| | `aarch64-sysroot` (old) | `r36s-sysroot` (current) |
+|---|---|---|
+| gcc / binutils | 16.2.0 / 2.47 | 16.2.0 / 2.47 (same Arch packages) |
+| target glibc | **2.44** | **2.41** (Debian trixie arm64) |
+| kernel headers | none | `linux-libc-dev` 6.1.176 arm64 |
+| runs on R36S? | ❌ `GLIBC_2.43 not found` | ✅ verified with a hello-world |
+
+**Why:** the dArkOS device reports `Debian GNU/Linux 13 (trixie)` with
+**glibc 2.41-12+deb13u1**. A binary linked against glibc 2.44 requires
+`GLIBC_2.43`, which the device's loader cannot satisfy:
 
 ```
-aarch64-linux-gnu-binutils 2.47
-aarch64-linux-gnu-gcc      16.2.0
-aarch64-linux-gnu-glibc     2.44
+./mc3: /lib/aarch64-linux-gnu/libm.so.6: version `GLIBC_2.43' not found (required by ./mc3)
 ```
+
+**How `r36s-sysroot` was built** (no root, no package manager):
+
+```bash
+cd ~/.hermes/cache/scratch/r36s
+BASE=https://deb.debian.org/debian/pool/main/g/glibc
+curl -sfLO $BASE/libc6_2.41-12+deb13u4_arm64.deb
+curl -sfLO $BASE/libc6-dev_2.41-12+deb13u4_arm64.deb
+curl -sfLO https://deb.debian.org/debian/pool/main/l/linux/linux-libc-dev_6.1.176-1_arm64.deb
+# extract each .deb: bsdtar -xf pkg.deb -C dir && tar -xf dir/data.tar.xz -C dir
+```
+
+Layout that works with the Arch gcc (`--sysroot=$SYS/usr`):
+
+```
+~/tools/r36s-sysroot/
+  usr/bin/aarch64-linux-gnu-{gcc,as,ld,ar,...}   # from Arch packages
+  usr/bin/{as,ld,ar,ranlib} -> aarch64-linux-gnu-* # symlinks: gcc shells out to bare `as`
+  usr/include/                                     # glibc + kernel headers, flat
+  usr/include/{bits,sys,gnu,asm,asm-generic}/      # copied up from include/aarch64-linux-gnu/
+  usr/lib/aarch64-linux-gnu/                       # libc.so.6, crt*.o, libc_nonshared.a, libgcc_s, libatomic
+  usr/lib/ld-linux-aarch64.so.1
+  usr/usr/lib/aarch64-linux-gnu/libc_nonshared.a   # absolute path referenced by libc.so linker script
+```
+
+Two non-obvious requirements:
+- gcc invokes a bare `as`, which resolves to the **host** x86 assembler unless
+  `as`/`ld` are symlinked to the aarch64-prefixed binaries.
+- the `libc.so` linker script references `/usr/lib/aarch64-linux-gnu/libc_nonshared.a`
+  and `/lib/ld-linux-aarch64.so.1` as **absolute** paths, so those must exist
+  under the sysroot as `$SYS/usr/usr/lib/...` and `$SYS/usr/lib/...`.
 
 Usage:
-```
-export CROSS=$HOME/tools/aarch64-sysroot
-export PATH="$CROSS/usr/bin:$PATH"
-aarch64-linux-gnu-gcc --sysroot="$CROSS/usr/aarch64-linux-gnu" ...
+
+```bash
+export PATH="$HOME/tools/r36s-sysroot/usr/bin:$PATH"
+cmake -S . -B build-r36s \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/r36s-toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-O2"
+cmake --build build-r36s --target mc3 -j "$(nproc)"
 ```
 
-**Verified**: a hello-world compiled to `ELF 64-bit LSB pie executable, ARM
-aarch64` and ran correctly under `qemu-aarch64-static -L $SYSROOT`.
+Build takes ~35 min: `scratch/generated/mc3_register.c` (34,344 `psp_register`
+calls in one translation unit) alone burns ~25 min of CPU and ~2.1 GB RSS.
+
+**Verified**: a hello-world cross-compiled with this sysroot reports
+`GLIBC_2.17`/`GLIBC_2.34` only and runs on the R36S, printing
+`hello r36s 1.414214`.
 
 (The Debian bullseye cross packages were tried first and their
 `libc6-*-arm64-cross` URLs 404 on the current mirror; the Arch path works and
@@ -396,7 +446,124 @@ Ways forward (need you):
 
 This workstation's ADB public key: `/home/amarqs/.android/adbkey.pub`.
 
-## 10. Directory layout (source-only, game data excluded)
+## 11. Compiler flags for the R36S — measured, not assumed
+
+**The R36S is a Cortex-A53, not a Cortex-A35.** `CPU part: 0xd04`,
+`Features: fp asimd evtstrm aes pmull sha1 sha2 crc32` — **no FMA**, no SVE,
+no fp16. The Mali-G31 GPU is present but the CPU has no fused multiply-add.
+
+### Flags that do not exist on AArch64
+
+```
+aarch64-linux-gnu-gcc: error: unrecognized command-line option '-mfpu=neon-fp-armv8'
+aarch64-linux-gnu-gcc: error: unrecognized command-line option '-mfloat-abi=hard'
+```
+
+`-mfpu` and `-mfloat-abi` are **ARM32** options. AArch64 has one FP ABI
+(hard-float is the only ABI) and one FP/ASIMD implementation, so they are
+meaningless there. The AArch64 equivalents of the intent are:
+
+| intent | AArch64 form |
+|---|---|
+| `-mfpu=neon-fp-armv8` | `-march=armv8-a+simd` (ASIMD is baseline for A53) |
+| `-mfloat-abi=hard` | implied; nothing to pass |
+| `-mcpu=cortex-a35` | `-mcpu=cortex-a53` (the actual core) |
+
+### Measured on the device (RK3326, 4× A53 @ ~1.3 GHz)
+
+Float/NEON kernel, 8M iterations, run on the R36S itself:
+
+| flags | time | vs baseline |
+|---|---|---|
+| `-O2` (baseline) | 0.287 s | — |
+| `-O3` | 0.294 s | **-2%** (slower) |
+| `-O3 -mcpu=cortex-a53 -march=armv8-a+simd` | 0.289 s | ~0% |
+| `... -ffast-math` | 0.260 s | **+9%** |
+| `-O3 -mcpu=cortex-a35` (wrong core) | 0.274 s | +5% |
+
+Software-rasterizer kernel (the actual bottleneck — 200 full-screen triangles
+× 300 frames, 640×363):
+
+| flags | fps | time |
+|---|---|---|
+| `-O2` | **3.4** | 88.275 s |
+| `-O3` | **3.4** | 88.071 s |
+| `-O3 -mcpu=cortex-a53 -march=armv8-a+simd` | **3.4** | 87.961 s |
+| `... -ffast-math` | **3.4** | 88.585 s |
+
+### Conclusion
+
+**Compiler flags are not the lever here.** The rasterizer is byte-for-byte
+identical in throughput across every flag set — the cost is per-pixel
+`put_pixel` work with a bounds check and a branch, which no amount of
+`-O3`/auto-vectorization removes, because the bottleneck is the scalar
+inner loop and the memory traffic to a 928 KB framebuffer, not the
+instruction count.
+
+The only flag with a measurable (single-digit-percent) effect is
+`-ffast-math`, and it is **unsafe to enable globally**: it is only valid
+because `src/psprecomp/src/vfpu.c` happens not to use `isnan`/`isinf`/
+`isfinite` (verified — zero matches), so nothing depends on IEEE
+NaN/Inf semantics. That is a property of the current file, not a guarantee.
+
+The real levers, in order of impact:
+
+1. **Use the GLES 3.2 backend.** The software rasterizer measured **3.4 fps**
+   on the R36S; the GPU path removes the per-pixel C work entirely. The
+   cross build currently has GLES disabled because the target sysroot has no
+   SDL2/EGL development packages.
+2. **Reduce per-pixel work** — render at lower internal resolution, or move
+   the rasterizer to the GPU.
+3. `-ffast-math` — ~9% on float-heavy code, at the cost of IEEE semantics.
+
+**Current cross-build flags:**
+`-O3 -mcpu=cortex-a53 -march=armv8-a+simd -fomit-frame-pointer -funroll-loops`
+(chosen because `-mcpu` matches the real core and the rest are
+semantics-preserving; `-ffast-math` deliberately excluded).
+
+---
+
+## 13. Device verification — R36S, 2026-11-01
+
+The R36S (dArkOSRE, Debian 13 trixie, glibc 2.41) is reachable at `192.168.2.121`
+with `ark` / `ark`. An ed25519 key was installed into
+`/home/ark/.ssh/authorized_keys`, so passwordless SSH works:
+
+```bash
+ssh -o StrictHostKeyChecking=no ark@192.168.2.121
+```
+
+(The device's SSH is Dropbear. The OpenSSH client on this host has no
+`ssh-askpass` helper, so password auth needs `SSH_ASKPASS=<script>
+SSH_ASKPASS_REQUIRE=force`; key auth avoids the problem entirely.)
+
+### What was verified on the device
+
+| Check | Result |
+|---|---|
+| Cross-built binary starts | ✅ `mc3: loaded PT_LOAD @ vaddr 0x00000000 filesz 0x424ec0` |
+| GLIBC symbols satisfied | ✅ binary needs max `GLIBC_2.38`, device has 2.41 |
+| GLES 3.2 backend initialises | ✅ `GLES OpenGL ES 3.2 v1.r13p0-01rel0.8747d14aec16ec21ac2b2da252c4ec5f` |
+| Window geometry | ✅ `640x480 window, content 640x363 at (0,58)` |
+| Game threads created | ✅ 3 threads: main `0x000000D8`, loader `0x000006B8`, render `0x002F302C` |
+| Title screen reached | ❌ not yet |
+| Remaining blocker | `unimplemented firmware call 0xEBD5C3E6` (SysMemUserForUser) |
+
+### Storage
+
+`/roms2` (SD1, 49 GB) was at 99% (819 MB free). `deadcells`, `halflife2` and
+`wind-waker-nextos` were removed, bringing it to **71% (14 GB free)**. The port
+lives at `/roms2/ports/midnight-club-lar/` with `data/PSP_GAME/SYSDIR/EBOOT.ELF`
+(md5 `49e3a397750e7f4199902d6708debf8d`, verified identical to the local file).
+
+### Deploy
+
+`tools/deploy_r36s.sh [host]` pushes the binary, launch script and port.json,
+verifies the GLIBC requirements on the device, and runs for 30 s.
+
+---
+
+## 14. Directory layout (source-only, game data excluded)
 
 ```
 /home/amarqs/recomp projects/Midnight Club - L.A. Remix (USA)/

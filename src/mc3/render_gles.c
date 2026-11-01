@@ -140,18 +140,25 @@ static int gles_init(int w, int h) {
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
 
-    g_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (g_egl_display == EGL_NO_DISPLAY) {
-        fprintf(stderr, "gles32: eglGetDisplay failed\n");
-        return -1;
-    }
-    EGLint major, minor;
-    if (!eglInitialize(g_egl_display, &major, &minor)) {
-        fprintf(stderr, "gles32: eglInitialize failed\n");
-        return -1;
-    }
+    /* SDL has already created and initialised the EGL display, context and
+     * surface for this window, and SDL_GL_MakeCurrent has made them current.
+     *
+     * There is no EGL_DEFAULT_DISPLAY to look up here: on the R36S, SDL
+     * opens the display through the KMSDRM driver (dArkOS runs
+     * EmulationStation on /dev/dri/card0 with no X11 or Wayland compositor),
+     * and eglGetDisplay(EGL_DEFAULT_DISPLAY) returns EGL_NO_DISPLAY in that
+     * setup even though SDL has the right display open.
+     *
+     * So take the context and surface from the current state instead of
+     * opening a second display. The buffer swap goes through
+     * SDL_GL_SwapWindow, which does not need the EGLDisplay either.
+     */
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
+    if (g_egl_context == EGL_NO_CONTEXT || g_egl_surface == EGL_NO_SURFACE) {
+        fprintf(stderr, "gles32: no current EGL context/surface\n");
+        return -1;
+    }
 
     /* Shaders */
     g_vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);

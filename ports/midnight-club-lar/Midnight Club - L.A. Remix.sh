@@ -33,6 +33,7 @@ find_eboot() {
     fi
     # 2. Common PortMaster locations (relative to port root)
     for cand in \
+        "$PORT_ROOT/data/PSP_GAME/SYSDIR/EBOOT.ELF" \
         "$PORT_ROOT/../userdata/EBOOT.ELF" \
         "$PORT_ROOT/../bios/EBOOT.ELF" \
         "$PORT_ROOT/EBOOT.ELF" \
