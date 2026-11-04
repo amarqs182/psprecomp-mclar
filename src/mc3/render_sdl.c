@@ -253,72 +253,83 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
     SDL_RenderPresent(g_renderer);
 }
 
-void sdl2_draw_frame(void) {
+/* Present loop: runs sdl2_draw_frame() at a fixed ~60 FPS until
+ * psp_exit_requested() returns true. Runs on a dedicated thread so
+ * presentation is independent of guest execution. */
+void sdl2_present_loop(void) {
     if (!g_tex || !g_renderer)
         return;
 
-    /* Process SDL events — detect window close (SDL_QUIT) so the game
-     * can exit cleanly when the user closes the window. */
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            psp_exit_requested_set(1);
-            return;
-        }
-    }
+    fprintf(stderr, "sdl2: present loop started (~60 FPS)\n");
+    fflush(stderr);
 
-    /* Lock texture */
-    void *pixels = NULL;
-    int pitch = 0;
-    if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) != 0) {
-        return;
-    }
-
-    if (!psp_render_get_fb_addr()) {
-        /* Game hasn't set a framebuffer yet — draw a test gradient so the
-         * user can see the window is working. */
-        uint8_t *dst = (uint8_t *)pixels;
-        for (int y = 0; y < 272; y++) {
-            for (int x = 0; x < 480; x++) {
-                dst[(y * 480 + x) * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R gradient */
-                dst[(y * 480 + x) * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G gradient */
-                dst[(y * 480 + x) * 4 + 2] = 128;                          /* B constant */
-                dst[(y * 480 + x) * 4 + 3] = 255;                          /* A opaque */
+    while (!psp_exit_requested()) {
+        /* Process SDL events — detect window close (SDL_QUIT) so the game
+         * can exit cleanly when the user closes the window. */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psp_exit_requested_set(1);
+                return;
             }
         }
-    } else {
-        /* Framebuffer definido pelo jogo — copiar a VRAM real do PSP.
-         * Antes mostrávamos o gradiente quando psp_render_pixels()==0, mas o
-         * backend SDL2 não conta pixels escritos na VRAM; use fb_addr != 0
-         * como sinal de que o jogo já configurou o framebuffer. */
-        uint32_t fb_addr = psp_render_get_fb_addr();
-        uint32_t fb_stride = psp_render_get_fb_stride();
-        /* Copy real PSP framebuffer from guest VRAM */
-        uint8_t row[512 * 4];
-        uint8_t *dst = (uint8_t *)pixels;
-        for (int y = 0; y < 272; y++) {
-            psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 512 * 4);
-            for (int x = 0; x < 480; x++) {
-                dst[(y * 480 + x) * 4 + 0] = row[x * 4 + 0];  /* R */
-                dst[(y * 480 + x) * 4 + 1] = row[x * 4 + 1];  /* G */
-                dst[(y * 480 + x) * 4 + 2] = row[x * 4 + 2];  /* B */
-                dst[(y * 480 + x) * 4 + 3] = row[x * 4 + 3];  /* A */
+
+        /* Lock texture */
+        void *pixels = NULL;
+        int pitch = 0;
+        if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) != 0) {
+            usleep(16667);
+            continue;
+        }
+
+        if (!psp_render_get_fb_addr()) {
+            /* Game hasn't set a framebuffer yet — draw a test gradient so the
+             * user can see the window is working. */
+            uint8_t *dst = (uint8_t *)pixels;
+            for (int y = 0; y < 272; y++) {
+                for (int x = 0; x < 480; x++) {
+                    dst[(y * 480 + x) * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R gradient */
+                    dst[(y * 480 + x) * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G gradient */
+                    dst[(y * 480 + x) * 4 + 2] = 128;                          /* B constant */
+                    dst[(y * 480 + x) * 4 + 3] = 255;                          /* A opaque */
+                }
+            }
+        } else {
+            /* Copy real PSP framebuffer from guest VRAM */
+            uint32_t fb_addr = psp_render_get_fb_addr();
+            uint32_t fb_stride = psp_render_get_fb_stride();
+            uint8_t row[512 * 4];
+            uint8_t *dst = (uint8_t *)pixels;
+            for (int y = 0; y < 272; y++) {
+                psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 512 * 4);
+                for (int x = 0; x < 480; x++) {
+                    dst[(y * 480 + x) * 4 + 0] = row[x * 4 + 0];  /* R */
+                    dst[(y * 480 + x) * 4 + 1] = row[x * 4 + 1];  /* G */
+                    dst[(y * 480 + x) * 4 + 2] = row[x * 4 + 2];  /* B */
+                    dst[(y * 480 + x) * 4 + 3] = row[x * 4 + 3];  /* A */
+                }
             }
         }
+
+        SDL_UnlockTexture(g_tex);
+
+        /* Render */
+        SDL_RenderClear(g_renderer);
+        SDL_Rect dst_rect = {
+            g_viewport_x,
+            g_viewport_y,
+            g_viewport_w,
+            g_viewport_h
+        };
+        SDL_RenderCopy(g_renderer, g_tex, NULL, &dst_rect);
+        SDL_RenderPresent(g_renderer);
+
+        /* ~60 FPS: ~16.6 ms per frame */
+        usleep(16667);
     }
 
-    SDL_UnlockTexture(g_tex);
-
-    /* Render */
-    SDL_RenderClear(g_renderer);
-    SDL_Rect dst_rect = {
-        g_viewport_x,
-        g_viewport_y,
-        g_viewport_w,
-        g_viewport_h
-    };
-    SDL_RenderCopy(g_renderer, g_tex, NULL, &dst_rect);
-    SDL_RenderPresent(g_renderer);
+    fprintf(stderr, "sdl2: present loop exiting\n");
+    fflush(stderr);
 }
 
 static void gles_finish(void) {

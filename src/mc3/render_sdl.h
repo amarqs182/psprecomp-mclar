@@ -12,4 +12,9 @@ extern const psp_render_backend psp_render_sdl2;
  * is always visible on screen. */
 extern void sdl2_draw_frame(void);
 
+/* Present loop: runs sdl2_draw_frame() at a fixed ~60 FPS until
+ * psp_exit_requested() returns true. Intended to be called from a dedicated
+ * present thread so presentation is independent of guest execution. */
+extern void sdl2_present_loop(void);
+
 #endif /* RENDER_SDL_H */
