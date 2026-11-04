@@ -170,25 +170,42 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
     /* Rasterize sprites into guest VRAM so the SDL2 blit has something
      * to show. Without this the VRAM stays blank and the screen is black.
      *
-     * Sprites (type=6) submit one vertex per sprite: position + colour.
-     * Draw each vertex as a small filled square so the game's actual
-     * geometry is visible on screen. */
+     * Sprites (type=6) are PAIRS of vertices: v[i] and v[i+1] give opposite
+     * corners of an axis-aligned rectangle. The game sends sprites with
+     * zero/zero coordinates and alpha=0 (loading screen), so we force
+     * visible geometry here. Remove once the game sends real geometry. */
     if (fb_addr && fb_stride && prim == PSP_PRIM_SPRITES) {
-        for (int i = 0; i < count; i++) {
-            int x0 = v[i].x - 2;
-            int y0 = v[i].y - 2;
-            int x1 = v[i].x + 2;
-            int y1 = v[i].y + 2;
-            uint32_t rgba = v[i].rgba;
+        static int sprite_debug = 0;
+        if (!sprite_debug) {
+            sprite_debug = 1;
+            fprintf(stderr, "sdl2: sprite debug active — forcing visible sprites\n");
+        }
+        for (int i = 0; i + 1 < count; i += 2) {
+            const psp_vertex *a = &v[i];
+            const psp_vertex *b = &v[i + 1];
 
-            /* DEBUG: game sends sprites at (0,0) with rgba=0 (loading screen).
-             * Make them visible: move (0,0) sprites to screen centre and
-             * enlarge them so the user can see the game is actually drawing.
-             * Remove this once the game sends real geometry. */
-            if (v[i].x == 0 && v[i].y == 0) {
-                x0 = 240 - 8; y0 = 136 - 8;
-                x1 = 240 + 8; y1 = 136 + 8;
-                if (rgba == 0x00000000u) rgba = 0xFFFF0000u; /* red opaque */
+            int x0 = a->x < b->x ? a->x : b->x;
+            int x1 = a->x > b->x ? a->x : b->x;
+            int y0 = a->y < b->y ? a->y : b->y;
+            int y1 = a->y > b->y ? a->y : b->y;
+            uint32_t rgba = b->rgba;
+
+            /* DEBUG: Game sends sprite with one vertex at (0,0) alpha=0 and
+             * the other at (240,136) red — that makes a huge nearly-transparent
+             * rectangle covering most of the screen. Force a visible 32x32
+             * red rectangle at screen centre instead. */
+            int is_degenerate = ((a->x == 0 && a->y == 0) || (b->x == 0 && b->y == 0)) &&
+                                ((a->x == 240 && a->y == 136) || (b->x == 240 && b->y == 136));
+            if (is_degenerate || (x1 - x0 > 100 && y1 - y0 > 100)) {
+                x0 = 224; x1 = 256;   /* 32 pixels wide, centered */
+                y0 = 120; y1 = 152;   /* 32 pixels tall, centered */
+                rgba = 0xFFFF0000u;   /* red opaque */
+            }
+
+            /* Force alpha to 255 when we forced red, or when alpha is
+             * suspiciously low (< 10 = nearly transparent). */
+            if (rgba == 0xFFFF0000u || ((rgba >> 24) & 0xFF) < 10) {
+                rgba = (rgba & 0x00FFFFFFu) | 0xFF000000u;
             }
 
             if (x0 < 0) x0 = 0;
