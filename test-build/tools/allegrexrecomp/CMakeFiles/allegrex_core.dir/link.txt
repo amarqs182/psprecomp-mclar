@@ -1,0 +1,2 @@
+/usr/bin/ar qc liballegrex_core.a CMakeFiles/allegrex_core.dir/decode.c.o CMakeFiles/allegrex_core.dir/container.c.o CMakeFiles/allegrex_core.dir/analyze.c.o CMakeFiles/allegrex_core.dir/emit.c.o CMakeFiles/allegrex_core.dir/keys.c.o CMakeFiles/allegrex_core.dir/crypto/aes.c.o CMakeFiles/allegrex_core.dir/crypto/cmac.c.o CMakeFiles/allegrex_core.dir/crypto/sha1.c.o CMakeFiles/allegrex_core.dir/crypto/kirk.c.o
+/usr/bin/ranlib liballegrex_core.a

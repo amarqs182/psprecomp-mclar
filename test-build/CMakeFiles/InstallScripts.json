@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/amarqs/mc3proj/test-build/cmake_install.cmake",
+		"/home/amarqs/mc3proj/test-build/tools/allegrexrecomp/cmake_install.cmake",
+		"/home/amarqs/mc3proj/test-build/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

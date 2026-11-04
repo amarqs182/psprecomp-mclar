@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_ctors.dir/link.d CMakeFiles/test_ctors.dir/test_ctors.c.o -o test_ctors  ../libpsprecomp.a -lm

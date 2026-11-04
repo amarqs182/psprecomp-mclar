@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_kirk.dir/link.d CMakeFiles/test_kirk.dir/test_kirk.c.o -o test_kirk  ../tools/allegrexrecomp/liballegrex_core.a

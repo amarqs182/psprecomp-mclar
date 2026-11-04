@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_hle.dir/link.d CMakeFiles/test_hle.dir/test_hle.c.o -o test_hle  ../libpsprecomp.a ../tools/allegrexrecomp/liballegrex_core.a -lm

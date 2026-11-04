@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_crypto.dir/link.d CMakeFiles/test_crypto.dir/test_crypto.c.o -o test_crypto  ../tools/allegrexrecomp/liballegrex_core.a

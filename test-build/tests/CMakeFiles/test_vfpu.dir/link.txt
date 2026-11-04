@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_vfpu.dir/link.d CMakeFiles/test_vfpu.dir/test_vfpu.c.o -o test_vfpu  ../libpsprecomp.a -lm

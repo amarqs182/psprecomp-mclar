@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/allegrexrecomp.dir/link.d CMakeFiles/allegrexrecomp.dir/main.c.o -o allegrexrecomp  liballegrex_core.a ../../libpsprecomp.a -lm

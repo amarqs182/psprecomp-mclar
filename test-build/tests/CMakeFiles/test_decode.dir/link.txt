@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_decode.dir/link.d CMakeFiles/test_decode.dir/test_decode.c.o -o test_decode  ../tools/allegrexrecomp/liballegrex_core.a

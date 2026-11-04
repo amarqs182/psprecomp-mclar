@@ -1,0 +1,21 @@
+decode 4 0.000353312
+runtime 0 0
+container 2 0.00245294
+crypto 2 0.00477291
+kirk 2 0.00998241
+emit 4 0.00172291
+hle 0 0
+scheduler 2 0.00734954
+thread_delete 2 0.00719435
+thread_pinned 2 0.00306402
+thread_pending 2 0.00244652
+thread_checkpoint0 2 0.00273004
+thread_checkpoint1 2 0.00270416
+thread_checkpoint2 2 0.00268349
+thread_checkpoint3 2 0.00275253
+thread_mask 2 0.00240228
+thread_reset 2 0.0105173
+vfpu 6 0.000259322
+ctors 2 0.0022181
+raster 2 0.0127465
+---

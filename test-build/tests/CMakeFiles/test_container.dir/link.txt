@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_container.dir/link.d CMakeFiles/test_container.dir/test_container.c.o -o test_container  ../tools/allegrexrecomp/liballegrex_core.a

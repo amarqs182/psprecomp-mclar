@@ -1,0 +1,1 @@
+/usr/bin/gcc -g -Wl,--dependency-file=CMakeFiles/test_thread_lifecycle.dir/link.d CMakeFiles/test_thread_lifecycle.dir/test_thread_lifecycle.c.o -o test_thread_lifecycle  ../libpsprecomp.a ../tools/allegrexrecomp/liballegrex_core.a -lm
