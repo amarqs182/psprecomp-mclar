@@ -306,6 +306,10 @@ static void gles_present(void) {
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_addr = addr;
     g_fb_stride = stride;
+    /* Publish the framebuffer target so the host (main.c, /dev/fb0 copy,
+     * present thread) can read it via psp_render_get_fb_addr(). Without this
+     * the host sees fb_addr == 0 and draws nothing. */
+    psp_render_set_target(addr, stride);
     (void)fmt;
 }
 
