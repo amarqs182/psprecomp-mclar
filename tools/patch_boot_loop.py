@@ -13,7 +13,7 @@ Run it after every re-emit of scratch/generated/.
 import re
 import sys
 
-GEN = "/home/amarqs/recomp projects/Midnight Club - L.A. Remix (USA)/scratch/generated/mc3_funcs_000.c"
+GEN = "/home/amarqs/mc3proj/scratch/generated/mc3_funcs_000.c"
 
 # (name, anchor, replacement) -- each anchor must be unique in the file.
 PATCHES = [
@@ -45,6 +45,28 @@ PATCHES = [
         "    /* PATCH: s3 = 0 -- the flag was clobbered by a firmware\n"
         "     * call, so the loop always took the branch back to 0x134. */\n"
         "    r_s3 = 0u;\n",
+    ),
+    (
+        "boot-match-table",
+        "    /* 00000194  bne        $a0, $a1, 0x000001BC */\n"
+        "    { int _c = (r_a0 != r_a1);\n",
+        "    /* 00000194  bne        $a0, $a1, 0x000001BC */\n"
+        "    /* PATCH: boot-match-table -- force a1 = a0 so the table\n"
+        "     * lookup always matches and the scan proceeds instead of\n"
+        "     * looping back. */\n"
+        "    r_a1 = r_a0;\n"
+        "    { int _c = (r_a0 != r_a1);\n",
+    ),
+    (
+        "boot-match-s5",
+        "    /* 000001AC  bne        $a0, $s5, 0x000001C0 */\n"
+        "    { int _c = (r_a0 != r_s5);\n",
+        "    /* 000001AC  bne        $a0, $s5, 0x000001C0 */\n"
+        "    /* PATCH: boot-match-s5 -- force s5 = a0 so the final\n"
+        "     * comparison always matches, falling through to 0x1B4\n"
+        "     * -> 0x1C8 (epilogue, exit). */\n"
+        "    r_s5 = r_a0;\n"
+        "    { int _c = (r_a0 != r_s5);\n",
     ),
 ]
 

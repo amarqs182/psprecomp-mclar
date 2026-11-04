@@ -48,3 +48,15 @@ build-*/
 .idea/
 .DS_Store
 *.swp
+
+# Runtime logs (debug output, not source)
+*.log
+/tmp/*.log
+
+# Built binaries (large, architecture-specific)
+build-native/src/mc3/mc3
+build-aarch64/src/mc3/mc3
+build-r36s/src/mc3/mc3
+build-*/src/mc3/mc3
+ports/midnight-club-lar/mc3
+ports/midnight-club-lar/mc3_trace

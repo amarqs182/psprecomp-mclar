@@ -14,6 +14,7 @@
  * Build: see src/mc3/CMakeLists.txt  (build psprecomp with -DPPSPRECOMP_REAL_THREADS=ON)
  */
 
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <psprecomp/cpu.h>
 #include <psprecomp/mem.h>
@@ -27,10 +28,16 @@
 #include <unistd.h>
 
 #include "render_gles.h"
+#include "render_gles2.h"
+#include "render_sdl.h"
+#include "render_terminal.h"
 
 #if defined(PSPRECOMP_HAVE_GLES)
 extern const psp_render_backend psp_render_gles32;
+extern const psp_render_backend psp_render_gles2;
 #endif
+extern const psp_render_backend psp_render_sdl2;
+extern const psp_render_backend psp_render_terminal;
 
 /* ---- SIGSEGV handler: report last guest function before crashing --------- */
 static void on_segv(int sig) {
@@ -44,12 +51,21 @@ static void on_segv(int sig) {
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <termios.h>
+#include <pthread.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/fb.h>
+#include <errno.h>
 
 #include "mc3_funcs.h"
 
@@ -57,6 +73,8 @@ extern void psp_recomp_register(void);   /* defined by mc3_register.c */
 
 /* Stub for indirect-call targets that discovery missed. */
 static void psp_stub_003F302C(void) { return; }
+static void psp_stub_0037FB3C(void) { return; }
+static void psp_stub_002CF4D0(void) { return; }
 
 /* ---- runtime state ------------------------------------------------------ */
 
@@ -64,6 +82,11 @@ static uint8_t *g_module_image;
 static uint32_t  g_module_size;
 static sigjmp_buf g_watchdog_jmp;
 static volatile int g_watchdog_fired = 0;
+
+/* Direct framebuffer presentation via /dev/fb0 (no SDL dependency). */
+static int   g_fb_fd = -1;
+static void *g_fb_mem = NULL;
+static uint32_t g_fb_w = 0, g_fb_h = 0;
 
 /* ---- small ELF32 loader ------------------------------------------------- */
 
@@ -155,6 +178,56 @@ static void on_alarm(int sig) {
     siglongjmp(g_watchdog_jmp, 1);
 }
 
+/* ---- teclado como controle PSP (para testes via QEMU) ------------------- */
+
+static uint32_t g_kbd_buttons = 0;
+
+static void *ctrl_reader(void *arg) {
+    (void)arg;
+    struct termios old, new;
+    tcgetattr(STDIN_FILENO, &old);
+    new = old;
+    new.c_lflag &= ~(ICANON | ECHO);
+    new.c_cc[VMIN] = 0;
+    new.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &new);
+
+    fprintf(stderr,
+        "mc3: controle de teclado ativo.\n"
+        "  X=cross   C=circle   S=square   T=triangle\n"
+        "  Enter=start   Espaço=select   setas=d-pad\n"
+        "  q=sair\n"
+        "Segure uma tecla para pressionar o botão, solte para liberar.\n");
+    fflush(stderr);
+
+    while (!psp_exit_requested()) {
+        struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+        if (poll(&pfd, 1, 50) > 0) {
+            int c = getchar();
+            if (c == 'q' || c == 'Q') break;
+            uint32_t btn = 0;
+            switch (c) {
+                case 'x': case 'X': btn = 0x4000u; break; /* CROSS */
+                case 'c': case 'C': btn = 0x2000u; break; /* CIRCLE */
+                case 's': case 'S': btn = 0x8000u; break; /* SQUARE */
+                case 't': case 'T': btn = 0x1000u; break; /* TRIANGLE */
+                case '\n': case '\r': btn = 0x0008u; break; /* START */
+                case ' ':         btn = 0x0001u; break; /* SELECT */
+                case 'A': case 'a': btn = 0x0080u; break; /* LEFT  */
+                case 'D': case 'd': btn = 0x0020u; break; /* RIGHT */
+                case 'W': case 'w': btn = 0x0010u; break; /* UP    */
+                case 'Z': case 'z': btn = 0x0040u; break; /* DOWN  */
+                default:          btn = 0u;           break; /* soltar */
+            }
+            psp_ctrl_set(btn, 128, 128);
+        }
+        /* Segura o botão por ~50ms para o jogo conseguir ler */
+        usleep(50000);
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &old);
+    return NULL;
+}
+
 /* ---- entry point -------------------------------------------------------- */
 
 int main(int argc, char **argv) {
@@ -198,11 +271,14 @@ int main(int argc, char **argv) {
     /* 3. register every recompiled function (+ interior labels) */
     psp_recomp_register();
 
-    /* Register indirect-call targets that discovery missed. 0x003F302C is
-     * called via jalr from somewhere in the boot path; it's not a function
-     * entry discovered by psprecomp, so register a stub that just returns. */
+    /* Register indirect-call targets that discovery missed. */
     psp_register(0x003F302Cu, psp_stub_003F302C);
     psp_register(0x003886A8u, psp_stub_003F302C);
+    /* These functions are called via jalr from discovered code but were not
+     * themselves discovered as function entries. They are real functions in
+     * the ELF, not jump-table entries -- see allegrexrecomp dis output. */
+    psp_register(0x0037FB3Cu, psp_stub_0037FB3C);   /* Thread 2 entry */
+    psp_register(0x002CF4D0u, psp_stub_002CF4D0);   /* Thread 5 entry */
 
     /* 3b. Register the boot-to-GE chain for hit counting. The static call
      * graph says module_start reaches the GE/Display init through
@@ -230,17 +306,46 @@ int main(int argc, char **argv) {
     psp_cpu.r[PSP_REG_SP] = 0x09FFF000u;   /* initial stack, in user RAM */
     psp_cpu.r[PSP_REG_GP] = 0x00007FF0u;   /* module gp_value */
 
-    /* 5. render backend. Register the GLES 3.2 backend (when available), then
+    /* 5. render backend. Register the GLES backends (when available), then
      * select by name. Default is software (reference). A real port uses
-     * gles32 on the RK3326. */
+     * gles2 on the RK3326 if GLES 3.2 is unavailable. */
 #if defined(PSPRECOMP_HAVE_GLES)
     psp_render_register_backend(&psp_render_gles32);
+    psp_render_register_backend(&psp_render_gles2);
 #endif
+    psp_render_register_backend(&psp_render_sdl2);
+    psp_render_register_backend(&psp_render_terminal);
     psp_render_select(render_name);
     if (psp_render_current()->init(640, 480) != 0) {
         fprintf(stderr, "mc3: render init failed (%s)\n", render_name); return 1;
     }
     fprintf(stderr, "mc3: render backend: %s\n", psp_render_current()->name);
+
+    /* Open /dev/fb0 for direct framebuffer presentation (software backend only).
+     * The software rasterizer draws into guest memory (g_ge.fbp); we copy
+     * it to /dev/fb0 each host frame so the game appears on the R36S screen.
+     * SDL2 backend does not use /dev/fb0 - it renders to an SDL window. */
+    if (strcmp(psp_render_current()->name, "software") == 0) {
+        g_fb_fd = open("/dev/fb0", O_RDWR);
+        if (g_fb_fd < 0) {
+            fprintf(stderr, "mc3: cannot open /dev/fb0: %s\n", strerror(errno));
+            return 1;
+        }
+        struct fb_var_screeninfo vinfo;
+        if (ioctl(g_fb_fd, FBIOGET_VSCREENINFO, &vinfo) != 0) {
+            fprintf(stderr, "mc3: FBIOGET_VSCREENINFO failed: %s\n", strerror(errno));
+            return 1;
+        }
+        g_fb_w = vinfo.xres;
+        g_fb_h = vinfo.yres;
+        size_t fb_size = vinfo.xres * vinfo.yres * (vinfo.bits_per_pixel / 8);
+        g_fb_mem = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
+        if (g_fb_mem == MAP_FAILED) {
+            fprintf(stderr, "mc3: mmap /dev/fb0 failed: %s\n", strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "mc3: fb0 %ux%u @ %p\n", g_fb_w, g_fb_h, g_fb_mem);
+    }
 
     /* 6. threading: main becomes the boot thread and runs module entry.
      * Guest threads (created by sceKernelCreateThread) run when module entry
@@ -424,36 +529,114 @@ int main(int argc, char **argv) {
      * backend is exercised and something appears on screen. */
     uint64_t frames = 0;
     int      drew_dummy = 0;
-    uint64_t max_frames = 300;
+    uint64_t max_frames = 100000000;
+    uint64_t frames_since_ge = 0;
     const char *frames_env = getenv("MC3_FRAMES");
     if (frames_env && *frames_env) {
         long v = atol(frames_env);
         if (v > 0) max_frames = (uint64_t)v;
     }
+
+    fprintf(stderr, "mc3: entering host frame loop\n");
+    fflush(stderr);
+
+    /* Thread de leitura de teclado para controle do jogo (QEMU).
+     * Desabilitado temporariamente devido a SEGSEGV com threads reais.
+    pthread_t ctrl_tid;
+    fprintf(stderr, "mc3: before pthread_create(ctrl_reader)\n");
+    fflush(stderr);
+    pthread_create(&ctrl_tid, NULL, ctrl_reader, NULL);
+    fprintf(stderr, "mc3: after pthread_create(ctrl_reader)\n");
+    fflush(stderr);
+    */
+    fprintf(stderr, "mc3: ctrl_reader disabled\n");
+    fflush(stderr);
+
+    /* Auto-envio de CROSS periodicamente para desbloquear o jogo no QEMU /
+     * R36s sem pad físico detectado via gptokeyb. Enviado a cada 60 frames
+     * (~1s) para permitir que o jogo avance nos menus. */
+
+    /* No automatic exit — the game runs until the user closes the window
+     * or presses Ctrl+C. The GE stall watchdog was removed because the
+     * game legitimately pauses between GE command bursts. */
+    (void)frames_since_ge;
+
+    /* Draw something every frame so the user always sees the window is
+     * alive. For the SDL2 backend this shows a test gradient until the
+     * game sets a framebuffer, then the real PSP framebuffer. For other
+     * backends this falls back to their present(). */
     while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
         psp_threadman_yield();                    /* let guest threads run */
 
-        /* If the game hasn't submitted any GE commands yet, draw a dummy
-         * triangle so we can verify the render backend works. */
-        if (psp_ge_command_count() == 0 && !drew_dummy) {
-            static const psp_vertex tri[3] = {
-                { .x = 160, .y = 60,  .rgba = 0xFFFF0000u }, /* red   */
-                { .x = 320, .y = 200, .rgba = 0xFF00FF00u }, /* green */
-                { .x = 320, .y = 60,  .rgba = 0xFF0000FFu }, /* blue  */
-            };
-            const psp_render_backend *be = psp_render_current();
-            be->set_target(0x04000000u, 512, 0);   /* VRAM base, 512 stride, 8888 */
-            be->draw(PSP_PRIM_TRIANGLES, tri, 3);
-            be->finish();
-            drew_dummy = 1;
+        /* Yield to the OS periodically so signals (SIGALRM watchdog) are
+         * delivered and the host frame loop can make progress even when a
+         * guest thread spins busy without calling yield. */
+        if ((frames % 100) == 0)
+            usleep(1000);
+
+        /* Saída de emergência: SELECT + START juntos encerra o jogo.
+         * SELECT = 0x0001, START = 0x0008. */
+        if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
+            fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
+            break;
         }
 
-        psp_render_current()->present();          /* show the framebuffer */
+        /* Tecla ESC encerra o jogo imediatamente. */
+        if (psp_exit_requested()) {
+            fprintf(stderr, "mc3: EXIT requested\n");
+            break;
+        }
+
+        /* Auto-envio de CROSS periodicamente depois do frame 120 para
+         * desbloquear o jogo no QEMU / R36s sem pad físico. Enviado a cada
+         * 60 frames (~1s) para permitir que o jogo avance nos menus. */
+        if (frames > 120 && (frames % 60) == 0) {
+            psp_ctrl_set(0x4000u, 128, 128);      /* CROSS held */
+            fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n",
+                    (unsigned long long)frames);
+        }
+
+        /* Draw the current frame (test gradient or real framebuffer) every
+         * frame so something is always visible on screen. */
+        sdl2_draw_frame();
+
+        /* Log GE command count changes for debugging */
+        {
+            static uint64_t last_ge_count = 0;
+            uint64_t current_ge_count = psp_ge_command_count();
+            if (current_ge_count != last_ge_count) {
+                fprintf(stderr, "mc3: GE commands %llu -> %llu at frame %llu\n",
+                        (unsigned long long)last_ge_count,
+                        (unsigned long long)current_ge_count,
+                        (unsigned long long)frames);
+                last_ge_count = current_ge_count;
+            }
+        }
+
+        /* Copy the GE framebuffer from guest memory to /dev/fb0. */
+        {
+            uint32_t fb_addr = psp_render_get_fb_addr();
+            uint32_t fb_stride = psp_render_get_fb_stride();
+            uint32_t row_bytes = 480 * 4;  /* 480 pixels * 4 bytes (RGBA8888) */
+            if (fb_addr && g_fb_mem) {
+                uint8_t *dst = (uint8_t *)g_fb_mem;
+                for (int y = 0; y < 272 && y < (int)g_fb_h; y++) {
+                    psp_mem_read_block(dst + (uint32_t)y * g_fb_w * 4,
+                                       fb_addr + (uint32_t)y * fb_stride * 4,
+                                       row_bytes);
+                }
+            }
+        }
+
         frames++;
+        if ((frames % 300) == 0) {
+            fprintf(stderr, "mc3: frame %llu, GE commands=%llu, GE vertices=%llu, GE pixels=%llu\n",
+                    (unsigned long long)frames,
+                    (unsigned long long)psp_ge_command_count(),
+                    (unsigned long long)psp_ge_vertex_count(),
+                    (unsigned long long)psp_render_pixels());
+        }
     }
-    if (frames > 0)
-        fprintf(stderr, "mc3: host frame loop ran %llu frames\n",
-                (unsigned long long)frames);
 
     /* ---- report --------------------------------------------------------- */
     fprintf(stderr, "\n=== mc3 report ===\n");
@@ -521,6 +704,10 @@ int main(int argc, char **argv) {
          * actually took -- the hit counts only say which links ran. */
         psp_trace_dump();
     }
+
+    /* Framebuffer cleanup. */
+    if (g_fb_mem) munmap(g_fb_mem, (size_t)g_fb_w * (size_t)g_fb_h * 4u);
+    if (g_fb_fd >= 0) close(g_fb_fd);
 
     psp_render_current()->shutdown();
     psp_mem_free();
