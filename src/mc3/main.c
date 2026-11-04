@@ -14,14 +14,15 @@
  * Build: see src/mc3/CMakeLists.txt  (build psprecomp with -DPPSPRECOMP_REAL_THREADS=ON)
  *
  * THREAD MODEL (host side):
- *   - Guest execution thread: runs module_start + guest threads (GE commands,
- *     vertex buffers, framebuffer setup). This is the "game" side.
- *   - Present thread: calls sdl2_draw_frame() at a fixed ~60 FPS. This is the
- *     "display" side. It reads the shared framebuffer state and blits to the
- *     SDL2 window.
- *   - The two threads share only the render backend state (fb_addr, fb_stride)
- *     and the exit_requested flag. No other guest state is touched by the
- *     present thread.
+ *   - Main thread: runs module_start (boot), creates and starts guest threads,
+ *     then pumps the host frame loop (psp_threadman_yield + present).
+ *   - Present thread: calls sdl2_present_loop() at a fixed ~60 FPS, reading the
+ *     shared framebuffer state set by guest execution. Independent of guest
+ *     execution so the window stays alive even if the game stalls.
+ *
+ * The guest threads (created via sceKernelCreateThread / sceKernelStartThread)
+ * run inside psp_threadman_yield() calls during the frame loop — they borrow
+ * the CPU from the main thread through the baton handover in threadman.c.
  */
 
 #define _DEFAULT_SOURCE
@@ -95,7 +96,7 @@ static int      g_shared_need_redraw = 0;
 static pthread_mutex_t g_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Called by render backends (GE_FBP / GE_FBW) when the game sets the
- * framebuffer target. Runs on the guest execution thread. */
+ * framebuffer target. Runs on guest execution context. */
 void psp_render_set_target_shared(uint32_t addr, uint32_t stride) {
     pthread_mutex_lock(&g_fb_mutex);
     g_shared_fb_addr = addr;
@@ -267,228 +268,17 @@ static void *ctrl_reader(void *arg) {
     return NULL;
 }
 
-/* ---- guest execution thread --------------------------------------------
- *
- * Runs module_start + all guest threads. This thread produces GE commands
- * and updates the framebuffer state. The present thread consumes that state
- * and blits to the window. */
-static void *guest_thread_main(void *arg) {
-    (void)arg;
-
-    /* Run module_start (entry 0x000005A4) as the boot thread.
-     * On a real PSP the kernel passes threadargs_size in $a0 and an arg
-     * buffer pointer in $a1. The game's loader thread checks $a0 > 0 before
-     * creating the main game threads, so we must pass non-zero $a0. */
-    psp_cpu.r[PSP_REG_A0] = 4u;
-    psp_cpu.r[PSP_REG_A1] = 0u;
-    fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
-    if (sigsetjmp(g_watchdog_jmp, 1) == 0) {
-        psp_func_000005A4();
-        fprintf(stderr, "mc3: module_start returned\n");
-    } else {
-        fprintf(stderr, "mc3: watchdog fired (module still running)\n");
-    }
-    alarm(0);
-
-    /* Create the game's main thread at entry 0x000000D8. */
-    {
-        psp_cpu.r[PSP_REG_A0] = 0u;           /* name */
-        psp_cpu.r[PSP_REG_A1] = 0x000000D8u;  /* entry */
-        psp_cpu.r[PSP_REG_A2] = 8u;           /* priority */
-        psp_cpu.r[PSP_REG_A3] = 0x10000u;      /* stackSize */
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);  /* attr */
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);  /* option */
-        psp_hle_call(0x446D8DE6u);             /* sceKernelCreateThread */
-        uint32_t thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created main thread uid=%u\n", thid);
-
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);             /* sceKernelStartThread */
-        fprintf(stderr, "mc3: started main thread\n");
-    }
-
-    /* Create the remaining threads that the game creates via
-     * sceKernelCreateThread. */
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x003F302Cu;
-        psp_cpu.r[PSP_REG_A2] = 16u;
-        psp_cpu.r[PSP_REG_A3] = 2048u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=2048\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x0037FB3Cu;
-        psp_cpu.r[PSP_REG_A2] = 16u;
-        psp_cpu.r[PSP_REG_A3] = 32768u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=32768\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x00382110u;
-        psp_cpu.r[PSP_REG_A2] = 17u;
-        psp_cpu.r[PSP_REG_A3] = 8192u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=17 stack=8192\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x00382518u;
-        psp_cpu.r[PSP_REG_A2] = 18u;
-        psp_cpu.r[PSP_REG_A3] = 2048u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=18 stack=2048\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x003817D0u;
-        psp_cpu.r[PSP_REG_A2] = 16u;
-        psp_cpu.r[PSP_REG_A3] = 2048u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=2048\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-    {
-        uint32_t thid;
-        psp_cpu.r[PSP_REG_A0] = 0u;
-        psp_cpu.r[PSP_REG_A1] = 0x003886A8u;
-        psp_cpu.r[PSP_REG_A2] = 16u;
-        psp_cpu.r[PSP_REG_A3] = 4096u;
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
-        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
-        psp_hle_call(0x446D8DE6u);
-        thid = psp_cpu.r[PSP_REG_V0];
-        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=4096\n", thid);
-        psp_cpu.r[PSP_REG_A0] = thid;
-        psp_cpu.r[PSP_REG_A1] = 0u;
-        psp_cpu.r[PSP_REG_A2] = 0u;
-        psp_hle_call(0xF475845Du);
-        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
-    }
-
-    /* Guest execution loop — yield to guest threads, pump GE commands,
-     * update shared framebuffer state. Runs until exit requested. */
-    uint64_t frames = 0;
-    uint64_t max_frames = 100000000;
-    const char *frames_env = getenv("MC3_FRAMES");
-    if (frames_env && *frames_env) {
-        long v = atol(frames_env);
-        if (v > 0) max_frames = (uint64_t)v;
-    }
-
-    fprintf(stderr, "mc3: entering guest execution loop\n");
-    fflush(stderr);
-
-    while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
-        psp_threadman_yield();                    /* let guest threads run */
-
-        /* Yield to the OS periodically so signals (SIGALRM watchdog) are
-         * delivered. */
-        if ((frames % 100) == 0)
-            usleep(1000);
-
-        /* Saída de emergência: SELECT + START juntos encerra o jogo.
-         * SELECT = 0x0001, START = 0x0008. */
-        if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
-            fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
-            break;
-        }
-
-        /* Auto-envio de CROSS periodicamente depois do frame 120 para
-         * desbloquear o jogo no QEMU / R36s sem pad físico. */
-        if (frames > 120 && (frames % 60) == 0) {
-            psp_ctrl_set(0x4000u, 128, 128);      /* CROSS held */
-            fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n",
-                    (unsigned long long)frames);
-        }
-
-        /* Log GE command count changes for debugging */
-        {
-            static uint64_t last_ge_count = 0;
-            uint64_t current_ge_count = psp_ge_command_count();
-            if (current_ge_count != last_ge_count) {
-                fprintf(stderr, "mc3: GE commands %llu -> %llu at frame %llu\n",
-                        (unsigned long long)last_ge_count,
-                        (unsigned long long)current_ge_count,
-                        (unsigned long long)frames);
-                last_ge_count = current_ge_count;
-            }
-        }
-
-        frames++;
-        if ((frames % 300) == 0) {
-            fprintf(stderr, "mc3: frame %llu, GE commands=%llu, GE vertices=%llu, GE pixels=%llu\n",
-                    (unsigned long long)frames,
-                    (unsigned long long)psp_ge_command_count(),
-                    (unsigned long long)psp_ge_vertex_count(),
-                    (unsigned long long)psp_render_pixels());
-        }
-    }
-
-    fprintf(stderr, "mc3: guest execution thread exiting\n");
-    fflush(stderr);
-    return NULL;
-}
-
 /* ---- present thread ------------------------------------------------------
  *
  * Calls sdl2_draw_frame() at a fixed rate (~60 FPS). Reads the shared
- * framebuffer state set by the guest thread and presents it to the window.
- * Independent of guest execution: if the game is stuck, the user still sees
- * the window alive (test gradient). */
+ * framebuffer state set by guest execution and presents it to the window.
+ * Independent of guest execution so the window stays alive even if the game
+ * stalls. */
 static void *present_thread_main(void *arg) {
     const char *render_name = (const char *)arg;
 
     /* The present thread owns the SDL2 window lifecycle: init, present,
-     * shutdown. The guest thread never touches SDL2 directly. */
+     * shutdown. Guest execution never touches SDL2 directly. */
     if (strcmp(render_name, "sdl2") == 0) {
         sdl2_present_loop();
     }
@@ -591,7 +381,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "mc3: fb0 %ux%u @ %p\n", g_fb_w, g_fb_h, g_fb_mem);
     }
 
-    /* 6. threading: start guest execution thread and present thread. */
+    /* 6. threading. module_start runs here (main context, not a guest thread),
+     * then guest threads are created and started here too. The present thread
+     * runs independently for presentation. */
     signal(SIGSEGV, on_segv);
     psp_threadman_reset();
 
@@ -608,10 +400,152 @@ int main(int argc, char **argv) {
     }
     alarm((unsigned)watchdog_secs);
 
-    /* Start the guest execution thread (runs module_start + guest threads). */
-    pthread_t guest_tid;
-    if (pthread_create(&guest_tid, NULL, guest_thread_main, NULL) != 0) {
-        fprintf(stderr, "mc3: failed to create guest thread\n"); return 1;
+    /* Run module_start (entry 0x000005A4) as the boot thread, in main context.
+     * On a real PSP the kernel passes threadargs_size in $a0 and an arg
+     * buffer pointer in $a1. The game's loader thread checks $a0 > 0 before
+     * creating the main game threads, so we must pass non-zero $a0. */
+    psp_cpu.r[PSP_REG_A0] = 4u;
+    psp_cpu.r[PSP_REG_A1] = 0u;
+    fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
+    if (sigsetjmp(g_watchdog_jmp, 1) == 0) {
+        psp_func_000005A4();
+        fprintf(stderr, "mc3: module_start returned\n");
+    } else {
+        fprintf(stderr, "mc3: watchdog fired (module still running)\n");
+    }
+    alarm(0);
+
+    /* Create the game's main thread at entry 0x000000D8 (Part 2 of
+     * function at vaddr 8 -- the delay loop that calls
+     * sceKernelDelayThreadCB + sceCtrlPeekBufferPositive). */
+    {
+        psp_cpu.r[PSP_REG_A0] = 0u;           /* name */
+        psp_cpu.r[PSP_REG_A1] = 0x000000D8u;  /* entry */
+        psp_cpu.r[PSP_REG_A2] = 8u;           /* priority */
+        psp_cpu.r[PSP_REG_A3] = 0x10000u;      /* stackSize */
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);  /* attr */
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);  /* option */
+        psp_hle_call(0x446D8DE6u);             /* sceKernelCreateThread */
+        uint32_t thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created main thread uid=%u\n", thid);
+
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);             /* sceKernelStartThread */
+        fprintf(stderr, "mc3: started main thread\n");
+    }
+
+    /* Create the remaining threads that the game creates via
+     * sceKernelCreateThread. Entry points and parameters were extracted from
+     * the disassembly of the sceKernelCreateThread call sites. */
+    {
+        uint32_t thid;
+        /* Thread 1: entry 0x003F302C, prio 16, stack 2048 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x003F302Cu;
+        psp_cpu.r[PSP_REG_A2] = 16u;
+        psp_cpu.r[PSP_REG_A3] = 2048u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=2048\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
+    }
+    {
+        uint32_t thid;
+        /* Thread 2: entry 0x0037FB3C, prio 16, stack 32768 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x0037FB3Cu;
+        psp_cpu.r[PSP_REG_A2] = 16u;
+        psp_cpu.r[PSP_REG_A3] = 32768u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=32768\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
+    }
+    {
+        uint32_t thid;
+        /* Thread 3: entry 0x00382110, prio 17, stack 8192 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x00382110u;
+        psp_cpu.r[PSP_REG_A2] = 17u;
+        psp_cpu.r[PSP_REG_A3] = 8192u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=17 stack=8192\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
+    }
+    {
+        uint32_t thid;
+        /* Thread 4: entry 0x00382518, prio 18, stack 2048 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x00382518u;
+        psp_cpu.r[PSP_REG_A2] = 18u;
+        psp_cpu.r[PSP_REG_A3] = 2048u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=18 stack=2048\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
+    }
+    {
+        uint32_t thid;
+        /* Thread 5: entry 0x003817D0, prio 16, stack 2048 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x003817D0u;
+        psp_cpu.r[PSP_REG_A2] = 16u;
+        psp_cpu.r[PSP_REG_A3] = 2048u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=2048\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
+    }
+    {
+        uint32_t thid;
+        /* Thread 6: entry 0x003886A8, prio 16, stack 4096 */
+        psp_cpu.r[PSP_REG_A0] = 0u;
+        psp_cpu.r[PSP_REG_A1] = 0x003886A8u;
+        psp_cpu.r[PSP_REG_A2] = 16u;
+        psp_cpu.r[PSP_REG_A3] = 4096u;
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 16, 0u);
+        psp_write32(psp_cpu.r[PSP_REG_SP] - 12, 0u);
+        psp_hle_call(0x446D8DE6u);
+        thid = psp_cpu.r[PSP_REG_V0];
+        fprintf(stderr, "mc3: created thread uid=%u entry=0x%08X prio=16 stack=4096\n", thid);
+        psp_cpu.r[PSP_REG_A0] = thid;
+        psp_cpu.r[PSP_REG_A1] = 0u;
+        psp_cpu.r[PSP_REG_A2] = 0u;
+        psp_hle_call(0xF475845Du);
+        fprintf(stderr, "mc3: started thread uid=%u\n", thid);
     }
 
     /* Start the present thread (runs SDL2 present loop at ~60 FPS). */
@@ -620,12 +554,77 @@ int main(int argc, char **argv) {
         fprintf(stderr, "mc3: failed to create present thread\n"); return 1;
     }
 
-    /* Wait for the guest thread to finish (module_start returns or watchdog fires). */
-    pthread_join(guest_tid, NULL);
+    /* 7. host frame loop — after module_start returns, keep pumping frames so
+     * guest threads get CPU time and the GE output can be presented. Each
+     * iteration yields to guest threads (they submit GE commands), then
+     * presents the accumulated framebuffer. */
+    uint64_t frames = 0;
+    uint64_t max_frames = 100000000;
+    const char *frames_env = getenv("MC3_FRAMES");
+    if (frames_env && *frames_env) {
+        long v = atol(frames_env);
+        if (v > 0) max_frames = (uint64_t)v;
+    }
 
-    /* Signal the present thread to stop. */
-    psp_exit_requested_set(1);
-    pthread_join(present_tid, NULL);
+    fprintf(stderr, "mc3: entering host frame loop\n");
+    fflush(stderr);
+
+    /* Auto-envio de CROSS periodicamente para desbloquear o jogo no QEMU /
+     * R36s sem pad físico detectado via gptokeyb. Enviado a cada 60 frames
+     * (~1s) para permitir que o jogo avance nos menus. */
+
+    while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
+        psp_threadman_yield();                    /* let guest threads run */
+
+        /* Yield to the OS periodically so signals (SIGALRM watchdog) are
+         * delivered. */
+        if ((frames % 100) == 0)
+            usleep(1000);
+
+        /* Saída de emergência: SELECT + START juntos encerra o jogo.
+         * SELECT = 0x0001, START = 0x0008. */
+        if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
+            fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
+            break;
+        }
+
+        /* Tecla ESC encerra o jogo imediatamente. */
+        if (psp_exit_requested()) {
+            fprintf(stderr, "mc3: EXIT requested\n");
+            break;
+        }
+
+        /* Auto-envio de CROSS periodicamente depois do frame 120 para
+         * desbloquear o jogo no QEMU / R36s sem pad físico. Enviado a cada
+         * 60 frames (~1s) para permitir que o jogo avance nos menus. */
+        if (frames > 120 && (frames % 60) == 0) {
+            psp_ctrl_set(0x4000u, 128, 128);      /* CROSS held */
+            fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n",
+                    (unsigned long long)frames);
+        }
+
+        /* Log GE command count changes for debugging */
+        {
+            static uint64_t last_ge_count = 0;
+            uint64_t current_ge_count = psp_ge_command_count();
+            if (current_ge_count != last_ge_count) {
+                fprintf(stderr, "mc3: GE commands %llu -> %llu at frame %llu\n",
+                        (unsigned long long)last_ge_count,
+                        (unsigned long long)current_ge_count,
+                        (unsigned long long)frames);
+                last_ge_count = current_ge_count;
+            }
+        }
+
+        frames++;
+        if ((frames % 300) == 0) {
+            fprintf(stderr, "mc3: frame %llu, GE commands=%llu, GE vertices=%llu, GE pixels=%llu\n",
+                    (unsigned long long)frames,
+                    (unsigned long long)psp_ge_command_count(),
+                    (unsigned long long)psp_ge_vertex_count(),
+                    (unsigned long long)psp_render_pixels());
+        }
+    }
 
     /* ---- report --------------------------------------------------------- */
     fprintf(stderr, "\n=== mc3 report ===\n");
@@ -633,6 +632,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "GE vertices:   %llu\n", (unsigned long long)psp_ge_vertex_count());
     fprintf(stderr, "GE pixels:     %llu  <-- >0 means the GE drew\n",
             (unsigned long long)psp_render_pixels());
+    fprintf(stderr, "host frames:   %llu\n", (unsigned long long)frames);
     fprintf(stderr, "dispatch:      %u registered, %llu misses\n",
             psp_dispatch_count(), (unsigned long long)psp_dispatch_misses());
     fprintf(stderr, "HLE unimplemented calls: %llu (logged %llu)\n",
@@ -681,6 +681,10 @@ int main(int argc, char **argv) {
                     (unsigned long long)psp_trace_watch_count(chain[i]));
         psp_trace_dump();
     }
+
+    /* Signal the present thread to stop and wait for it. */
+    psp_exit_requested_set(1);
+    pthread_join(present_tid, NULL);
 
     /* Framebuffer cleanup. */
     if (g_fb_mem) munmap(g_fb_mem, (size_t)g_fb_w * (size_t)g_fb_h * 4u);
